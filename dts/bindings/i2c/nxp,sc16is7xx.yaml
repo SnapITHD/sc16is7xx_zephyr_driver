@@ -2,9 +2,48 @@ description: Opito SC16IS7xx I2C DUAL UART
 
 compatible: "nxp,sc16is7xx"
 
-include: [i2c-device.yaml, pinctrl-device.yaml]
+include: [i2c-device.yaml]
 
 properties:
+  reg:
+    required: true
+
+  clock-frequency:
+    type: int
+    required: true
+    description: |
+      Crystal/clock frequency in Hz. Common values are 1843200 or 14745600.
+
+  spr:
+    type: int
+    required: false
+    description: |
+      Value of the SPR register
+
+  interrupt-gpios:
+    type: phandle-array
+    required: false
+    description: Interrupt GPIO pin (active-low open-drain)
+
+  num-ports:
+    type: int
+    required: true
+    description: |
+      Number of serial ports on this device.
+
+child-binding:
+  include: [uart-controller.yaml]
+
+  description: UART device over SC16IS7XX IC
+
+  properties:
+    "#address-cells":
+      required: true
+      const: 1
+    "#size-cells":
+      required: true
+      const: 0
+
     reg:
       required: true
 
@@ -14,18 +53,14 @@ properties:
       description: |
         Value of the SPR register
 
-    interrupt-gpios:
-      type: phandle-array
+    serial-mode:
       required: false
-      description: Interrupt GPIO pin (active-low open-drain)
-
-    num-ports:
-      type: int
-      required: true
+      type: string
       description: |
-        Number of serial ports on this device. 
-
-
-
-
-
+        Configures the GPIO for the electrical interface selected
+        Default to RS232 if not specified.
+      enum:
+        - "rs232"
+        - "rs485"
+        - "rs422"
+      default: "rs232"

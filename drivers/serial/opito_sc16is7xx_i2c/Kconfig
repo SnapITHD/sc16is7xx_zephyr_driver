@@ -26,4 +26,3 @@ source "subsys/logging/Kconfig.template.log_config"
 
 endmenu
 
-

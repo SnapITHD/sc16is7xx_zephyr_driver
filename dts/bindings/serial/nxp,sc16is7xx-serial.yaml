@@ -4,31 +4,24 @@ compatible: "nxp,sc16is7xx-serial"
 
 include: [uart-controller.yaml]
 
-child-binding:
-    description: UART device over SC16IS7XX IC
-    
-    properties:
-        reg:
-          required: true
+properties:
+  reg:
+    required: true
 
-        spr:
-          type: int
-          required: false
-          description: |
-            Value of the SPR register
+  spr:
+    type: int
+    required: false
+    description: |
+      Value of the SPR register
 
-        serial-mode:
-          required: false
-          type: string
-          description: |
-            Configures the GPIO for the electrical interface selected
-            Default to RS232 if not specified. This is only available on 
-            the Optio interface as we have wired on SP330E transceiver 
-            to the SC16IS752 GPIOs
-          enum:
-            - "rs232"
-            - "rs485"
-            - "rs422"
-
-
-
+  serial-mode:
+    required: false
+    type: string
+    description: |
+      Configures the GPIO for the electrical interface selected
+      Default to RS232 if not specified.
+    enum:
+      - "rs232"
+      - "rs485"
+      - "rs422"
+    default: "rs232"
