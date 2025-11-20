@@ -12,7 +12,7 @@
  * @brief SC16IS7XX Serial Driver - RS-485 Configuration
  *
  * This is the driver for the NXP SC16IS7XX I2C UART Chip
- * Configured for RS-485 operation with automatic direction control
+ * Configured for RS-485 operation with GPIO-controlled transceivers
  */
 
 #include <errno.h>
@@ -35,7 +35,7 @@
 #include "sc16is7xx.h"
 #include <zephyr/drivers/gpio.h>
 
-LOG_MODULE_REGISTER(sc16is7xx, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(sc16is7xx, LOG_LEVEL_INF);
 
 /* register definitions */
 
@@ -104,24 +104,27 @@ LOG_MODULE_REGISTER(sc16is7xx, LOG_LEVEL_DBG);
 #define SC16IS7XX_FCR_TXLVLH_BIT (1 << 5) /* TX Trigger level MSB */
 
 /* GPIO RS-485 control bits - Based on actual hardware schematic */
-/* Channel A (MODBUS Port 1) */
-#define CHANNEL_A_TX_EN (1 << 0) // GPIO0 - Driver 1 enable (active HIGH to transmit)
-#define CHANNEL_A_RX_EN (1 << 1) // GPIO1 - Receiver 1 enable (active LOW to receive)
 
-/* Channel B (MODBUS Port 2) */
-#define CHANNEL_B_TX_EN (1 << 2) // GPIO2 - Driver 2 enable (active HIGH to transmit)
-#define CHANNEL_B_RX_EN (1 << 3) // GPIO3 - Receiver 2 enable (active LOW to receive)
+/* Channel A (MODBUS Port 1) - Transceiver control */
+#define CHANNEL_A_DE (1 << 0) // GPIO0 - Driver Enable (active HIGH to transmit)
+#define CHANNEL_A_RE (1 << 1) // GPIO1 - Receiver Enable (active LOW to receive)
 
-/* Power control pins (GPIO4-7) - Not used for serial mode configuration */
-#define RS485_PORT1_PWR_EN (1 << 4) // GPIO4 - Enable power for sensor port 1
-#define RS485_PORT2_PWR_EN (1 << 5) // GPIO5 - Enable power for sensor port 2
-#define POWER_5V_EN (1 << 5)        // GPIO5 - 5V_MODBUS_ON_OFF
-#define POWER_12V_EN (1 << 6)       // GPIO6 - 12V_MODBUS_ON_OFF
-#define HW_RESET_CTRL (1 << 7)      // GPIO7 - Hardware reset control
+/* Channel B (MODBUS Port 2) - Transceiver control */
+#define CHANNEL_B_DE (1 << 2) // GPIO2 - Driver Enable (active HIGH to transmit)
+#define CHANNEL_B_RE (1 << 3) // GPIO3 - Receiver Enable (active LOW to receive)
 
-/* Masks for transceiver control only */
-#define CHANNEL_A_MASK (CHANNEL_A_TX_EN | CHANNEL_A_RX_EN)
-#define CHANNEL_B_MASK (CHANNEL_B_TX_EN | CHANNEL_B_RX_EN)
+/* Power control pins */
+#define PORT_A_POWER_EN (1 << 4) // GPIO4 - Enable ground for Port A (active HIGH)
+#define PORT_B_POWER_EN (1 << 5) // GPIO5 - Enable ground for Port B (active HIGH)
+#define POWER_5V_EN (1 << 6)     // GPIO6 - Enable 5V rail (active HIGH)
+#define POWER_12V_EN (1 << 7)    // GPIO7 - Enable 12V rail (active HIGH)
+
+/* Masks for transceiver control per channel */
+#define CHANNEL_A_TRANSCEIVER_MASK (CHANNEL_A_DE | CHANNEL_A_RE)
+#define CHANNEL_B_TRANSCEIVER_MASK (CHANNEL_B_DE | CHANNEL_B_RE)
+
+/* All power control bits */
+#define POWER_CONTROL_MASK (PORT_A_POWER_EN | PORT_B_POWER_EN | POWER_5V_EN | POWER_12V_EN)
 
 /* EFCR register bit definitions for RS-485 auto direction control */
 #define EFCR_AUTO_RS485_DIR (1 << 4) // bit 4: Enable automatic RTS direction control
@@ -223,8 +226,11 @@ LOG_MODULE_REGISTER(sc16is7xx, LOG_LEVEL_DBG);
 
 int sc16is17xx_reg_read(const struct device *dev, uint8_t reg);
 int sc16is17xx_reg_write(const struct device *dev, uint8_t reg, uint8_t val);
+
+#ifdef CONFIG_SC16IS7XX_INTERRUPT_DRIVEN
 static void sc16is7xx_isr(const struct device *dev);
 static int sc16is7xx_irq_update(const struct device *dev);
+#endif
 
 #define INBYTE(dev, x) sc16is17xx_reg_read(dev, x)
 #define OUTBYTE(dev, x, d) sc16is17xx_reg_write(dev, x, d)
@@ -233,8 +239,8 @@ static int sc16is7xx_irq_update(const struct device *dev);
 enum sc16is7xx_serial_mode
 {
     SC16IS7XX_MODE_RS232 = 0, /* Standard RS-232 */
-    SC16IS7XX_MODE_RS485 = 1, /* RS-485 with auto direction control */
-    SC16IS7XX_MODE_RS422 = 2, /* RS-422 (future support) */
+    SC16IS7XX_MODE_RS485 = 1, /* RS-485 with GPIO direction control */
+    SC16IS7XX_MODE_RS422 = 2, /* RS-422 full-duplex */
 };
 
 /* device config */
@@ -268,6 +274,306 @@ struct sc16is7xx_dev_data
     bool tx_stream_on;
 #endif
 };
+
+/* ============================================================================
+ * CHIP-LEVEL STATE MANAGEMENT (Per-Chip, Independent of UARTs)
+ * ============================================================================ */
+
+#define MAX_SC16IS7XX_CHIPS 4 /* Support up to 4 chips (addresses 0x48-0x4B) */
+
+/**
+ * @brief Per-chip state structure
+ *
+ * Each physical SC16IS7XX chip maintains its own independent state,
+ * regardless of how many UART channels it has.
+ */
+struct sc16is7xx_chip_state
+{
+    bool initialized;       /* Has this chip been initialized? */
+    uint8_t gpio_state;     /* Current GPIO state for this chip */
+    uint16_t i2c_addr;      /* 7-bit I2C address (0x48, 0x49, etc.) */
+    struct i2c_dt_spec bus; /* I2C bus spec for register access */
+};
+
+/* Global chip state array - protected by mutex */
+static struct k_mutex sc16is7xx_chip_mutex;
+static bool sc16is7xx_chip_mutex_initialized = false;
+static struct sc16is7xx_chip_state sc16is7xx_chips[MAX_SC16IS7XX_CHIPS] = {0};
+
+/**
+ * @brief Get chip index from I2C address
+ *
+ * @param addr 7-bit I2C address
+ * @return Chip index (0-3) or -1 if not found
+ */
+static int sc16is7xx_get_chip_index(uint16_t addr)
+{
+    /* First, check if this address is already tracked */
+    for (int i = 0; i < MAX_SC16IS7XX_CHIPS; i++)
+    {
+        if (sc16is7xx_chips[i].i2c_addr == addr)
+        {
+            return i;
+        }
+    }
+
+    /* Not found, allocate a new slot */
+    for (int i = 0; i < MAX_SC16IS7XX_CHIPS; i++)
+    {
+        if (sc16is7xx_chips[i].i2c_addr == 0)
+        {
+            sc16is7xx_chips[i].i2c_addr = addr;
+            return i;
+        }
+    }
+
+    /* No free slots */
+    return -1;
+}
+
+/**
+ * @brief Get chip state structure
+ *
+ * @param dev Device structure (from any UART channel on the chip)
+ * @return Pointer to chip state or NULL on error
+ */
+static struct sc16is7xx_chip_state *sc16is7xx_get_chip_state(const struct device *dev)
+{
+    const struct sc16is7xx_device_config *const config = dev->config;
+    int chip_idx = sc16is7xx_get_chip_index(config->bus.addr);
+
+    if (chip_idx < 0)
+    {
+        LOG_ERR("Too many SC16IS7XX chips! Max supported: %d", MAX_SC16IS7XX_CHIPS);
+        return NULL;
+    }
+
+    /* Store bus spec for later use if not already set */
+    if (sc16is7xx_chips[chip_idx].bus.bus == NULL)
+    {
+        sc16is7xx_chips[chip_idx].bus = config->bus;
+    }
+
+    return &sc16is7xx_chips[chip_idx];
+}
+
+/**
+ * @brief Chip-level register read (uses chip state, not UART device)
+ */
+static uint8_t sc16is7xx_chip_reg_read(struct sc16is7xx_chip_state *chip, uint8_t reg)
+{
+    uint8_t data;
+    i2c_burst_read_dt(&chip->bus, reg, &data, 1);
+    return data;
+}
+
+/**
+ * @brief Chip-level register write (uses chip state, not UART device)
+ */
+static int sc16is7xx_chip_reg_write(struct sc16is7xx_chip_state *chip, uint8_t reg, uint8_t val)
+{
+    uint8_t tx_buf[2];
+    tx_buf[0] = reg;
+    tx_buf[1] = val;
+    return i2c_write_dt(&chip->bus, tx_buf, sizeof(tx_buf));
+}
+
+/**
+ * @brief Initialize chip-level hardware (GPIO, power rails, reset)
+ */
+static int sc16is7xx_chip_hardware_init(const struct device *dev)
+{
+    const struct sc16is7xx_device_config *const config = dev->config;
+    int ret = 0;
+
+    /* Initialize mutex on first call (global, one-time) */
+    if (!sc16is7xx_chip_mutex_initialized)
+    {
+        k_mutex_init(&sc16is7xx_chip_mutex);
+        sc16is7xx_chip_mutex_initialized = true;
+        LOG_DBG("Global chip mutex initialized");
+    }
+
+    k_mutex_lock(&sc16is7xx_chip_mutex, K_FOREVER);
+
+    /* Get this chip's state */
+    struct sc16is7xx_chip_state *chip = sc16is7xx_get_chip_state(dev);
+    if (!chip)
+    {
+        k_mutex_unlock(&sc16is7xx_chip_mutex);
+        return -ENOMEM;
+    }
+
+    if (!chip->initialized)
+    {
+        LOG_INF("=== SC16IS7XX Chip @ 0x%02X Hardware Initialization ===",
+                config->bus.addr);
+
+        /* Software reset - affects BOTH channels on THIS chip */
+        LOG_INF("Chip @ 0x%02X: Performing hardware reset...", config->bus.addr);
+
+        /* GPIO registers don't need channel offset - they're shared */
+        sc16is7xx_chip_reg_write(chip, REG_IOCONTROL << 3, 0x08);
+        k_sleep(K_MSEC(10));
+
+        /* Configure all GPIO pins as outputs */
+        sc16is7xx_chip_reg_write(chip, REG_IODIR << 3, 0xFF);
+
+        /* Initialize this chip's GPIO state:
+         * - Power rails OFF
+         * - Port power OFF
+         * - Transceivers in receive mode (DE=LOW, RE=LOW)
+         */
+        chip->gpio_state = 0x00;
+        sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+
+        LOG_INF("Chip @ 0x%02X: GPIO initialized to 0x%02X (all OFF, RX mode)",
+                config->bus.addr, chip->gpio_state);
+
+        /* === POWER SEQUENCING TEST === */
+        LOG_INF("=== Power Sequencing Test: Chip @ 0x%02X ===", config->bus.addr);
+
+        /* Step 1: Enable 12V rail */
+        LOG_INF("Chip @ 0x%02X: Step 1 - Enabling 12V rail...", config->bus.addr);
+        chip->gpio_state |= POWER_12V_EN;
+        sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+        LOG_INF("  12V ON - GPIO state = 0x%02X", chip->gpio_state);
+        k_sleep(K_MSEC(500));
+
+        /* Step 2: Enable 5V rail */
+        LOG_INF("Chip @ 0x%02X: Step 2 - Enabling 5V rail...", config->bus.addr);
+        chip->gpio_state |= POWER_5V_EN;
+        sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+        LOG_INF("  5V ON - GPIO state = 0x%02X", chip->gpio_state);
+        k_sleep(K_MSEC(500));
+
+        /* Step 3: Enable Port A power */
+        LOG_INF("Chip @ 0x%02X: Step 3 - Enabling Port A power...", config->bus.addr);
+        chip->gpio_state |= PORT_A_POWER_EN;
+        sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+        LOG_INF("  Port A ON - GPIO state = 0x%02X", chip->gpio_state);
+        k_sleep(K_MSEC(500));
+
+        /* Step 4: Enable Port B power */
+        LOG_INF("Chip @ 0x%02X: Step 4 - Enabling Port B power...", config->bus.addr);
+        chip->gpio_state |= PORT_B_POWER_EN;
+        sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+        LOG_INF("  Port B ON - GPIO state = 0x%02X", chip->gpio_state);
+        k_sleep(K_MSEC(500));
+
+        LOG_INF("=== Power Sequencing Complete: Chip @ 0x%02X ===", config->bus.addr);
+        LOG_INF("All power rails enabled for chip @ 0x%02X", config->bus.addr);
+        LOG_INF("Final GPIO state = 0x%02X", chip->gpio_state);
+
+        /* Verify by reading back */
+        uint8_t gpio_readback = sc16is7xx_chip_reg_read(chip, REG_IOSTATE << 3);
+        LOG_INF("GPIO readback = 0x%02X", gpio_readback);
+
+        if (gpio_readback != chip->gpio_state)
+        {
+            LOG_WRN("Chip @ 0x%02X: GPIO readback mismatch! Expected 0x%02X, got 0x%02X",
+                    config->bus.addr, chip->gpio_state, gpio_readback);
+        }
+
+        chip->initialized = true;
+        LOG_INF("=== Chip @ 0x%02X Hardware Initialization Complete ===",
+                config->bus.addr);
+    }
+    else
+    {
+        LOG_DBG("Chip @ 0x%02X: Already initialized, skipping hardware init",
+                config->bus.addr);
+    }
+
+    k_mutex_unlock(&sc16is7xx_chip_mutex);
+
+    return ret;
+}
+
+/**
+ * @brief Control GPIO state for a specific chip
+ */
+int sc16is7xx_chip_gpio_control(uint16_t chip_addr, uint8_t gpio_mask, uint8_t gpio_value)
+{
+    k_mutex_lock(&sc16is7xx_chip_mutex, K_FOREVER);
+
+    /* Find the chip */
+    int chip_idx = sc16is7xx_get_chip_index(chip_addr);
+    if (chip_idx < 0)
+    {
+        k_mutex_unlock(&sc16is7xx_chip_mutex);
+        return -ENODEV;
+    }
+
+    struct sc16is7xx_chip_state *chip = &sc16is7xx_chips[chip_idx];
+
+    if (!chip->initialized)
+    {
+        k_mutex_unlock(&sc16is7xx_chip_mutex);
+        return -EINVAL;
+    }
+
+    /* Modify only the specified bits */
+    chip->gpio_state = (chip->gpio_state & ~gpio_mask) | (gpio_value & gpio_mask);
+    sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+
+    LOG_DBG("Chip @ 0x%02X: GPIO updated to 0x%02X (mask=0x%02X, value=0x%02X)",
+            chip_addr, chip->gpio_state, gpio_mask, gpio_value);
+
+    k_mutex_unlock(&sc16is7xx_chip_mutex);
+
+    return 0;
+}
+
+/**
+ * @brief Configure transceiver direction control for a specific UART channel
+ */
+static void sc16is7xx_set_transceiver_direction(const struct device *dev, bool transmit)
+{
+    const struct sc16is7xx_device_config *const dev_cfg = dev->config;
+
+    k_mutex_lock(&sc16is7xx_chip_mutex, K_FOREVER);
+
+    struct sc16is7xx_chip_state *chip = sc16is7xx_get_chip_state(dev);
+    if (!chip)
+    {
+        k_mutex_unlock(&sc16is7xx_chip_mutex);
+        return;
+    }
+
+    if (dev_cfg->serport_num == 0)
+    {
+        /* Channel A */
+        if (transmit)
+        {
+            chip->gpio_state |= CHANNEL_A_DE;
+            chip->gpio_state |= CHANNEL_A_RE;
+        }
+        else
+        {
+            chip->gpio_state &= ~CHANNEL_A_DE;
+            chip->gpio_state &= ~CHANNEL_A_RE;
+        }
+    }
+    else
+    {
+        /* Channel B */
+        if (transmit)
+        {
+            chip->gpio_state |= CHANNEL_B_DE;
+            chip->gpio_state |= CHANNEL_B_RE;
+        }
+        else
+        {
+            chip->gpio_state &= ~CHANNEL_B_DE;
+            chip->gpio_state &= ~CHANNEL_B_RE;
+        }
+    }
+
+    sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+
+    k_mutex_unlock(&sc16is7xx_chip_mutex);
+}
 
 #ifdef CONFIG_SC16IS7XX_INTERRUPT_DRIVEN
 
@@ -321,11 +627,6 @@ static inline uintptr_t get_port(const struct device *dev)
     return config->serport_num << 1;
 }
 
-static void set_reset(const struct device *dev)
-{
-    OUTBYTE(dev, IOCONTROL(dev), 0x08);
-}
-
 static void set_baud_rate(const struct device *dev, uint32_t baud_rate, uint32_t pclk)
 {
     struct sc16is7xx_dev_data *const dev_data = dev->data;
@@ -343,6 +644,8 @@ static void set_baud_rate(const struct device *dev, uint32_t baud_rate, uint32_t
         OUTBYTE(dev, BRDL(dev), (unsigned char)(divisor & 0xff));
         OUTBYTE(dev, BRDH(dev), (unsigned char)((divisor >> 8) & 0xff));
 
+        OUTBYTE(dev, LCR(dev), lcr_cache);
+
         OUTBYTE(dev, LCR(dev), LCR_EFR_ACCESS);
         OUTBYTE(dev, EFR(dev), 0x00);
 
@@ -353,137 +656,72 @@ static void set_baud_rate(const struct device *dev, uint32_t baud_rate, uint32_t
 }
 
 /**
- * @brief Configure UART for RS-232, RS-485, or RS-422 operation based on device tree
- *
- * RS-232 mode: Basic UART operation with RTS/CTS for flow control
- * RS-485 mode: Automatic direction control via RTS pin and GPIO transceiver control
- * RS-422 mode: Full-duplex differential signaling (future support)
+ * @brief Configure UART channel mode (RS-232, RS-485, RS-422)
  */
 static void configure_uart_mode(const struct device *dev)
 {
     const struct sc16is7xx_device_config *const dev_cfg = dev->config;
-    uint8_t gpio_state = 0;
     uint8_t efcr = 0;
-    uint8_t mcr = 0;
 
-    /* Read current EFCR register */
     efcr = INBYTE(dev, EFCR(dev));
 
     switch (dev_cfg->mode)
     {
     case SC16IS7XX_MODE_RS485:
-        /* ===== RS-485 MODE CONFIGURATION ===== */
-        LOG_INF("Configuring channel %d for RS-485 mode", dev_cfg->serport_num);
+        LOG_INF("Chip @ 0x%02X, Channel %d: Configuring for RS-485 mode",
+                dev_cfg->bus.addr, dev_cfg->serport_num);
 
-        /* Set all GPIO pins as outputs for transceiver control */
-        OUTBYTE(dev, IOCONTROL(dev), 0x00);
-        OUTBYTE(dev, IODIR(dev), 0xFF);
-
-        /* Read current GPIO state */
-        gpio_state = INBYTE(dev, IOSTATE(dev));
-        LOG_DBG("Initial GPIO state = 0x%02X", gpio_state);
-
-        if (dev_cfg->serport_num == 0) /* Channel A (MODBUS Port 1) */
-        {
-            /* Clear transceiver control bits for Channel A */
-            gpio_state &= ~CHANNEL_A_MASK;
-
-            /* TX disabled (GPIO0 = 0), RX enabled (GPIO1 = 0, active LOW) */
-            gpio_state &= ~CHANNEL_A_TX_EN;
-            gpio_state &= ~CHANNEL_A_RX_EN;
-
-            OUTBYTE(dev, IOSTATE(dev), gpio_state);
-
-            LOG_INF("Channel A RS-485: GPIO=0x%02X", INBYTE(dev, IOSTATE(dev)));
-        }
-        else if (dev_cfg->serport_num == 1) /* Channel B (MODBUS Port 2) */
-        {
-            /* Clear transceiver control bits for Channel B */
-            gpio_state &= ~CHANNEL_B_MASK;
-
-            /* TX disabled (GPIO2 = 0), RX enabled (GPIO3 = 0, active LOW) */
-            gpio_state &= ~CHANNEL_B_TX_EN;
-            gpio_state &= ~CHANNEL_B_RX_EN;
-
-            OUTBYTE(dev, IOSTATE(dev), gpio_state);
-
-            LOG_INF("Channel B RS-485: GPIO=0x%02X", INBYTE(dev, IOSTATE(dev)));
-        }
-
-        /* Enable RS-485 automatic direction control via EFCR */
-        efcr |= EFCR_AUTO_RS485_DIR; /* Enable auto direction control */
-        efcr |= EFCR_RTS_INVERT;     /* RTS=1 during TX (for DE pin) */
-        OUTBYTE(dev, EFCR(dev), efcr);
-
-        LOG_INF("Channel %d RS-485 configured: EFCR=0x%02X",
-                dev_cfg->serport_num, efcr);
-        break;
-
-    case SC16IS7XX_MODE_RS422:
-        /* ===== RS-422 MODE CONFIGURATION ===== */
-        LOG_INF("Configuring channel %d for RS-422 mode", dev_cfg->serport_num);
-
-        /* RS-422 is full-duplex, so no direction control needed */
-        /* Clear RS-485 bits */
         efcr &= ~EFCR_AUTO_RS485_DIR;
         efcr &= ~EFCR_RTS_INVERT;
         efcr &= ~EFCR_9BIT_MODE_BIT;
-
         OUTBYTE(dev, EFCR(dev), efcr);
 
-        /* Configure GPIO for RS-422 transceiver enables if needed */
-        /* RS-422 transceivers typically have separate TX/RX enable pins */
-        OUTBYTE(dev, IOCONTROL(dev), 0x00);
-        OUTBYTE(dev, IODIR(dev), 0xFF);
+        sc16is7xx_set_transceiver_direction(dev, false);
 
-        gpio_state = INBYTE(dev, IOSTATE(dev));
+        LOG_INF("Channel %d RS-485 configured: EFCR=0x%02X", dev_cfg->serport_num, efcr);
+        break;
 
-        if (dev_cfg->serport_num == 0) /* Channel A */
+    case SC16IS7XX_MODE_RS422:
+        LOG_INF("Chip @ 0x%02X, Channel %d: Configuring for RS-422 mode",
+                dev_cfg->bus.addr, dev_cfg->serport_num);
+
+        efcr &= ~EFCR_AUTO_RS485_DIR;
+        efcr &= ~EFCR_RTS_INVERT;
+        efcr &= ~EFCR_9BIT_MODE_BIT;
+        OUTBYTE(dev, EFCR(dev), efcr);
+
+        k_mutex_lock(&sc16is7xx_chip_mutex, K_FOREVER);
+        struct sc16is7xx_chip_state *chip = sc16is7xx_get_chip_state(dev);
+        if (chip)
         {
-            /* For RS-422: Enable both TX and RX transceivers simultaneously */
-            gpio_state |= CHANNEL_A_TX_EN;  /* TX enable HIGH */
-            gpio_state &= ~CHANNEL_A_RX_EN; /* RX enable LOW (active low) */
-            OUTBYTE(dev, IOSTATE(dev), gpio_state);
-
-            LOG_INF("Channel A RS-422: GPIO=0x%02X", INBYTE(dev, IOSTATE(dev)));
+            if (dev_cfg->serport_num == 0)
+            {
+                chip->gpio_state |= CHANNEL_A_DE;
+                chip->gpio_state &= ~CHANNEL_A_RE;
+            }
+            else
+            {
+                chip->gpio_state |= CHANNEL_B_DE;
+                chip->gpio_state &= ~CHANNEL_B_RE;
+            }
+            sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
         }
-        else if (dev_cfg->serport_num == 1) /* Channel B */
-        {
-            gpio_state |= CHANNEL_B_TX_EN;  /* TX enable HIGH */
-            gpio_state &= ~CHANNEL_B_RX_EN; /* RX enable LOW (active low) */
-            OUTBYTE(dev, IOSTATE(dev), gpio_state);
+        k_mutex_unlock(&sc16is7xx_chip_mutex);
 
-            LOG_INF("Channel B RS-422: GPIO=0x%02X", INBYTE(dev, IOSTATE(dev)));
-        }
-
-        /* Set RTS/DTR active for good measure */
-        mcr = INBYTE(dev, MCR(dev));
-        mcr |= MCR_RTS_BIT | MCR_DTR_BIT;
-        OUTBYTE(dev, MCR(dev), mcr);
-
-        LOG_INF("Channel %d RS-422 configured: EFCR=0x%02X MCR=0x%02X",
-                dev_cfg->serport_num, efcr, mcr);
+        LOG_INF("Channel %d RS-422 configured: EFCR=0x%02X", dev_cfg->serport_num, efcr);
         break;
 
     case SC16IS7XX_MODE_RS232:
     default:
-        /* ===== RS-232 MODE CONFIGURATION ===== */
-        LOG_INF("Configuring channel %d for RS-232 mode", dev_cfg->serport_num);
+        LOG_INF("Chip @ 0x%02X, Channel %d: Configuring for RS-232 mode",
+                dev_cfg->bus.addr, dev_cfg->serport_num);
 
-        /* Clear RS-485 bits to ensure normal RS-232 mode */
-        efcr &= ~EFCR_AUTO_RS485_DIR; /* Disable auto RS-485 direction */
-        efcr &= ~EFCR_RTS_INVERT;     /* Normal RTS polarity */
-        efcr &= ~EFCR_9BIT_MODE_BIT;  /* Disable 9-bit/multidrop mode */
-
+        efcr &= ~EFCR_AUTO_RS485_DIR;
+        efcr &= ~EFCR_RTS_INVERT;
+        efcr &= ~EFCR_9BIT_MODE_BIT;
         OUTBYTE(dev, EFCR(dev), efcr);
 
-        /* Set RTS and DTR to active (LOW) for standard RS-232 */
-        mcr = INBYTE(dev, MCR(dev));
-        mcr |= MCR_RTS_BIT | MCR_DTR_BIT; /* Assert RTS and DTR */
-        OUTBYTE(dev, MCR(dev), mcr);
-
-        LOG_INF("Channel %d RS-232 configured: EFCR=0x%02X MCR=0x%02X",
-                dev_cfg->serport_num, efcr, mcr);
+        LOG_INF("Channel %d RS-232 configured: EFCR=0x%02X", dev_cfg->serport_num, efcr);
         break;
     }
 }
@@ -498,7 +736,6 @@ static int sc16is7xx_configure(const struct device *dev,
     uint32_t pclk = 0U;
     k_spinlock_key_t key = k_spin_lock(&dev_data->lock);
 
-    /* Configure transceiver */
     configure_uart_mode(dev);
 
 #ifdef CONFIG_SC16IS7XX_INTERRUPT_DRIVEN
@@ -551,19 +788,17 @@ static int sc16is7xx_configure(const struct device *dev,
         uart_cfg.parity = LCR_PEN;
         break;
     default:
+        ret = -ENOTSUP;
         goto out;
     }
 
     dev_data->uart_config = *cfg;
 
-    OUTBYTE(dev, LCR(dev),
-            uart_cfg.data_bits | uart_cfg.stop_bits | uart_cfg.parity);
+    uint8_t lcr_value = uart_cfg.data_bits | uart_cfg.stop_bits | uart_cfg.parity;
+    OUTBYTE(dev, LCR(dev), lcr_value);
 
-    // mcr = MCR_RTS_BIT | MCR_DTR_BIT;
-    if (cfg->flow_ctrl == UART_CFG_FLOW_CTRL_RTS_CTS)
-    {
-        /* Flow control if needed */
-    }
+    pclk = dev_cfg->sys_clk_freq;
+    set_baud_rate(dev, cfg->baudrate, pclk);
 
     OUTBYTE(dev, FCR(dev),
             FCR_FIFO | FCR_FIFO_8 | FCR_RCVRCLR | FCR_XMITCLR | FCR_FIFO_64);
@@ -582,8 +817,6 @@ static int sc16is7xx_configure(const struct device *dev,
 #ifdef CONFIG_SC16IS7XX_INTERRUPT_DRIVEN
     OUTBYTE(dev, IER(dev), 0x00);
 #endif
-    pclk = dev_cfg->sys_clk_freq;
-    set_baud_rate(dev, cfg->baudrate, pclk);
 
 out:
     k_spin_unlock(&dev_data->lock, key);
@@ -618,6 +851,15 @@ static int sc16is7xx_init(const struct device *dev)
         return -ENODEV;
     }
 
+    /* === STEP 1: Initialize chip hardware (once per chip) === */
+    ret = sc16is7xx_chip_hardware_init(dev);
+    if (ret != 0)
+    {
+        LOG_ERR("Chip hardware initialization failed: ret=%d", ret);
+        return ret;
+    }
+
+    /* === STEP 2: Test UART channel communication === */
     ret = sc16is17xx_reg_write(dev, SPR(dev), 0xAB);
     if (ret < 0)
     {
@@ -628,19 +870,21 @@ static int sc16is7xx_init(const struct device *dev)
     uint8_t ping_req = sc16is17xx_reg_read(dev, SPR(dev));
     if (ping_req == 0xAB)
     {
-        LOG_INF("SC16IS7XX channel %d communication OK", config->serport_num);
+        LOG_INF("Chip @ 0x%02X, Channel %d: Communication OK",
+                config->bus.addr, config->serport_num);
     }
     else
     {
-        LOG_ERR("SC16IS7XX channel %d communication failed (expected 0xAB, got 0x%02X)",
-                config->serport_num, ping_req);
+        LOG_ERR("Chip @ 0x%02X, Channel %d: Communication failed (expected 0xAB, got 0x%02X)",
+                config->bus.addr, config->serport_num, ping_req);
         return -EIO;
     }
 
+    /* === STEP 3: Configure UART channel parameters === */
     ret = sc16is7xx_configure(dev, &data->uart_config);
     if (ret != 0)
     {
-        LOG_ERR("sc16is7xx_configure failed: ret=[%d]", ret); // ← Add this
+        LOG_ERR("sc16is7xx_configure failed: ret=%d", ret);
         return ret;
     }
 
@@ -659,7 +903,7 @@ static int sc16is7xx_init(const struct device *dev)
     ret = gpio_pin_configure_dt(&config->int_gpio, GPIO_INPUT);
     if (ret != 0)
     {
-        LOG_ERR("sc16is7xx[0x%X]: failed to configure interrupt pin %d (%d)",
+        LOG_ERR("sc16is7xx[0x%02X]: failed to configure interrupt pin %d (%d)",
                 config->bus.addr, config->int_gpio.pin, ret);
         return ret;
     }
@@ -676,6 +920,9 @@ static int sc16is7xx_init(const struct device *dev)
         return ret;
     }
 #endif
+
+    LOG_INF("Chip @ 0x%02X, Channel %d: Initialization complete",
+            config->bus.addr, config->serport_num);
     return 0;
 }
 
@@ -1019,10 +1266,10 @@ static const struct uart_driver_api sc16is7xx_driver_api = {
 };
 
 /* Helper macro to convert string token to enum */
-
 #define SERIAL_MODE_ENUM(node_id)                                                                                                                  \
     (DT_ENUM_HAS_VALUE(node_id, serial_mode, rs485) ? SC16IS7XX_MODE_RS485 : DT_ENUM_HAS_VALUE(node_id, serial_mode, rs422) ? SC16IS7XX_MODE_RS422 \
                                                                                                                             : SC16IS7XX_MODE_RS232)
+
 /* Device initialization macro for nested child binding */
 #define SC16IS7XX_DEVICE_INIT(node_id)                                           \
     static const struct sc16is7xx_device_config sc16is7xx_dev_cfg_##node_id = {  \
