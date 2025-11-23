@@ -1,1 +1,1 @@
-add_subdirectory_ifdef(CONFIG_SC16IS7XX opito_sc16is7xx_i2c)
+add_subdirectory_ifdef(CONFIG_SC16IS7XX sc16is7xx_i2c)

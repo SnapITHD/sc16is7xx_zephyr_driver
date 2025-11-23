@@ -32,7 +32,7 @@
 
 #include <zephyr/logging/log.h>
 #include <zephyr/drivers/i2c.h>
-#include "sc16is7xx.h"
+#include "drivers/serial/sc16is7xx.h"
 #include <zephyr/drivers/gpio.h>
 
 LOG_MODULE_REGISTER(sc16is7xx, LOG_LEVEL_INF);
@@ -199,28 +199,26 @@ LOG_MODULE_REGISTER(sc16is7xx, LOG_LEVEL_INF);
 #define EFR_SWFLOW1_BIT (1 << 1)      /* SWFLOW bit 1 */
 #define EFR_SWFLOW0_BIT (1 << 0)      /* SWFLOW bit 0 */
 
-#define reg_interval(x) 3
-
-#define THR(dev) (REG_THR << reg_interval(dev) | get_port(dev))
-#define RDR(dev) (REG_RDR << reg_interval(dev) | get_port(dev))
-#define BRDL(dev) (REG_BRDL << reg_interval(dev) | get_port(dev))
-#define BRDH(dev) (REG_BRDH << reg_interval(dev) | get_port(dev))
-#define IER(dev) (REG_IER << reg_interval(dev) | get_port(dev))
-#define IIR(dev) (REG_IIR << reg_interval(dev) | get_port(dev))
-#define FCR(dev) (REG_FCR << reg_interval(dev) | get_port(dev))
-#define LCR(dev) (REG_LCR << reg_interval(dev) | get_port(dev))
-#define MCR(dev) (REG_MCR << reg_interval(dev) | get_port(dev))
-#define LSR(dev) (REG_LSR << reg_interval(dev) | get_port(dev))
-#define MSR(dev) (REG_MSR << reg_interval(dev) | get_port(dev))
-#define SPR(dev) (REG_SPR << reg_interval(dev) | get_port(dev))
-#define EFR(dev) (REG_EFR << reg_interval(dev) | get_port(dev))
-#define TXLVL(dev) (REG_TXLVL << reg_interval(dev) | get_port(dev))
-#define RXLVL(dev) (REG_RXLVL << reg_interval(dev) | get_port(dev))
-#define IODIR(dev) (REG_IODIR << reg_interval(dev))
-#define IOSTATE(dev) (REG_IOSTATE << reg_interval(dev))
-#define IOINTENA(dev) (REG_IOINTENA << reg_interval(dev))
-#define IOCONTROL(dev) (REG_IOCONTROL << reg_interval(dev))
-#define EFCR(dev) (REG_EFCR << reg_interval(dev) | get_port(dev))
+#define THR(dev) (REG_THR << 3 | get_port(dev))
+#define RDR(dev) (REG_RDR << 3 | get_port(dev))
+#define BRDL(dev) (REG_BRDL << 3 | get_port(dev))
+#define BRDH(dev) (REG_BRDH << 3 | get_port(dev))
+#define IER(dev) (REG_IER << 3 | get_port(dev))
+#define IIR(dev) (REG_IIR << 3 | get_port(dev))
+#define FCR(dev) (REG_FCR << 3 | get_port(dev))
+#define LCR(dev) (REG_LCR << 3 | get_port(dev))
+#define MCR(dev) (REG_MCR << 3 | get_port(dev))
+#define LSR(dev) (REG_LSR << 3 | get_port(dev))
+#define MSR(dev) (REG_MSR << 3 | get_port(dev))
+#define SPR(dev) (REG_SPR << 3 | get_port(dev))
+#define EFR(dev) (REG_EFR << 3 | get_port(dev))
+#define TXLVL(dev) (REG_TXLVL << 3 | get_port(dev))
+#define RXLVL(dev) (REG_RXLVL << 3 | get_port(dev))
+#define IODIR (REG_IODIR << 3)
+#define IOSTATE (REG_IOSTATE << 3)
+#define IOINTENA (REG_IOINTENA << 3)
+#define IOCONTROL (REG_IOCONTROL << 3)
+#define EFCR(dev) (REG_EFCR << 3 | get_port(dev))
 
 #define IIRC(dev) (((struct sc16is7xx_dev_data *)(dev)->data)->iir_cache)
 
@@ -331,6 +329,12 @@ static int sc16is7xx_get_chip_index(uint16_t addr)
     return -1;
 }
 
+static inline uintptr_t get_port(const struct device *dev)
+{
+    const struct sc16is7xx_device_config *config = dev->config;
+
+    return config->serport_num << 1;
+}
 /**
  * @brief Get chip state structure
  *
@@ -413,11 +417,11 @@ static int sc16is7xx_chip_hardware_init(const struct device *dev)
         LOG_INF("Chip @ 0x%02X: Performing hardware reset...", config->bus.addr);
 
         /* GPIO registers don't need channel offset - they're shared */
-        sc16is7xx_chip_reg_write(chip, REG_IOCONTROL << 3, 0x08);
+        sc16is7xx_chip_reg_write(chip, IOCONTROL, 0x08);
         k_sleep(K_MSEC(10));
 
         /* Configure all GPIO pins as outputs */
-        sc16is7xx_chip_reg_write(chip, REG_IODIR << 3, 0xFF);
+        sc16is7xx_chip_reg_write(chip, IODIR, 0xFF);
 
         /* Initialize this chip's GPIO state:
          * - Power rails OFF
@@ -425,7 +429,7 @@ static int sc16is7xx_chip_hardware_init(const struct device *dev)
          * - Transceivers in receive mode (DE=LOW, RE=LOW)
          */
         chip->gpio_state = 0x00;
-        sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+        sc16is7xx_chip_reg_write(chip, IOSTATE, chip->gpio_state);
 
         LOG_INF("Chip @ 0x%02X: GPIO initialized to 0x%02X (all OFF, RX mode)",
                 config->bus.addr, chip->gpio_state);
@@ -436,28 +440,28 @@ static int sc16is7xx_chip_hardware_init(const struct device *dev)
         /* Step 1: Enable 12V rail */
         LOG_INF("Chip @ 0x%02X: Step 1 - Enabling 12V rail...", config->bus.addr);
         chip->gpio_state |= POWER_12V_EN;
-        sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+        sc16is7xx_chip_reg_write(chip, IOSTATE, chip->gpio_state);
         LOG_INF("  12V ON - GPIO state = 0x%02X", chip->gpio_state);
         k_sleep(K_MSEC(500));
 
         /* Step 2: Enable 5V rail */
         LOG_INF("Chip @ 0x%02X: Step 2 - Enabling 5V rail...", config->bus.addr);
         chip->gpio_state |= POWER_5V_EN;
-        sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+        sc16is7xx_chip_reg_write(chip, IOSTATE, chip->gpio_state);
         LOG_INF("  5V ON - GPIO state = 0x%02X", chip->gpio_state);
         k_sleep(K_MSEC(500));
 
         /* Step 3: Enable Port A power */
         LOG_INF("Chip @ 0x%02X: Step 3 - Enabling Port A power...", config->bus.addr);
         chip->gpio_state |= PORT_A_POWER_EN;
-        sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+        sc16is7xx_chip_reg_write(chip, IOSTATE, chip->gpio_state);
         LOG_INF("  Port A ON - GPIO state = 0x%02X", chip->gpio_state);
         k_sleep(K_MSEC(500));
 
         /* Step 4: Enable Port B power */
         LOG_INF("Chip @ 0x%02X: Step 4 - Enabling Port B power...", config->bus.addr);
         chip->gpio_state |= PORT_B_POWER_EN;
-        sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+        sc16is7xx_chip_reg_write(chip, IOSTATE, chip->gpio_state);
         LOG_INF("  Port B ON - GPIO state = 0x%02X", chip->gpio_state);
         k_sleep(K_MSEC(500));
 
@@ -466,7 +470,7 @@ static int sc16is7xx_chip_hardware_init(const struct device *dev)
         LOG_INF("Final GPIO state = 0x%02X", chip->gpio_state);
 
         /* Verify by reading back */
-        uint8_t gpio_readback = sc16is7xx_chip_reg_read(chip, REG_IOSTATE << 3);
+        uint8_t gpio_readback = sc16is7xx_chip_reg_read(chip, IOSTATE);
         LOG_INF("GPIO readback = 0x%02X", gpio_readback);
 
         if (gpio_readback != chip->gpio_state)
@@ -515,7 +519,7 @@ int sc16is7xx_chip_gpio_control(uint16_t chip_addr, uint8_t gpio_mask, uint8_t g
 
     /* Modify only the specified bits */
     chip->gpio_state = (chip->gpio_state & ~gpio_mask) | (gpio_value & gpio_mask);
-    sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+    sc16is7xx_chip_reg_write(chip, IOSTATE, chip->gpio_state);
 
     LOG_DBG("Chip @ 0x%02X: GPIO updated to 0x%02X (mask=0x%02X, value=0x%02X)",
             chip_addr, chip->gpio_state, gpio_mask, gpio_value);
@@ -570,7 +574,7 @@ static void sc16is7xx_set_transceiver_direction(const struct device *dev, bool t
         }
     }
 
-    sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+    sc16is7xx_chip_reg_write(chip, IOSTATE, chip->gpio_state);
 
     k_mutex_unlock(&sc16is7xx_chip_mutex);
 }
@@ -620,13 +624,6 @@ int sc16is17xx_reg_write(const struct device *dev, uint8_t reg, uint8_t val)
 
 static const struct uart_driver_api sc16is7xx_driver_api;
 
-static inline uintptr_t get_port(const struct device *dev)
-{
-    const struct sc16is7xx_device_config *config = dev->config;
-
-    return config->serport_num << 1;
-}
-
 static void set_baud_rate(const struct device *dev, uint32_t baud_rate, uint32_t pclk)
 {
     struct sc16is7xx_dev_data *const dev_data = dev->data;
@@ -675,8 +672,14 @@ static void configure_uart_mode(const struct device *dev)
         efcr &= ~EFCR_RTS_INVERT;
         efcr &= ~EFCR_9BIT_MODE_BIT;
         OUTBYTE(dev, EFCR(dev), efcr);
-
-        sc16is7xx_set_transceiver_direction(dev, false);
+        // if (dev_cfg->serport_num == 1)
+        // {
+        //     sc16is7xx_set_transceiver_direction(dev, false);
+        // }
+        // else
+        // {
+        //     sc16is7xx_set_transceiver_direction(dev, false);
+        // }
 
         LOG_INF("Channel %d RS-485 configured: EFCR=0x%02X", dev_cfg->serport_num, efcr);
         break;
@@ -686,6 +689,7 @@ static void configure_uart_mode(const struct device *dev)
                 dev_cfg->bus.addr, dev_cfg->serport_num);
 
         efcr &= ~EFCR_AUTO_RS485_DIR;
+
         efcr &= ~EFCR_RTS_INVERT;
         efcr &= ~EFCR_9BIT_MODE_BIT;
         OUTBYTE(dev, EFCR(dev), efcr);
@@ -704,7 +708,7 @@ static void configure_uart_mode(const struct device *dev)
                 chip->gpio_state |= CHANNEL_B_DE;
                 chip->gpio_state &= ~CHANNEL_B_RE;
             }
-            sc16is7xx_chip_reg_write(chip, REG_IOSTATE << 3, chip->gpio_state);
+            sc16is7xx_chip_reg_write(chip, IOSTATE, chip->gpio_state);
         }
         k_mutex_unlock(&sc16is7xx_chip_mutex);
 
@@ -716,10 +720,33 @@ static void configure_uart_mode(const struct device *dev)
         LOG_INF("Chip @ 0x%02X, Channel %d: Configuring for RS-232 mode",
                 dev_cfg->bus.addr, dev_cfg->serport_num);
 
-        efcr &= ~EFCR_AUTO_RS485_DIR;
-        efcr &= ~EFCR_RTS_INVERT;
-        efcr &= ~EFCR_9BIT_MODE_BIT;
+        efcr = 0x00;
         OUTBYTE(dev, EFCR(dev), efcr);
+
+        // **DISABLE the RS-485 transceiver for RS-232 mode**
+        // Set DE=0 (driver disabled), RE=1 (receiver disabled/tri-stated)
+        k_mutex_lock(&sc16is7xx_chip_mutex, K_FOREVER);
+        struct sc16is7xx_chip_state *chip_232 = sc16is7xx_get_chip_state(dev);
+        if (chip_232)
+        {
+            if (dev_cfg->serport_num == 0)
+            {
+                // Channel A: Disable transceiver
+                chip_232->gpio_state &= ~CHANNEL_A_DE; // DE = 0 (driver OFF)
+                chip_232->gpio_state |= CHANNEL_A_RE;  // RE = 1 (receiver OFF/tri-state)
+            }
+            else
+            {
+                // Channel B: Disable transceiver
+                chip_232->gpio_state &= ~CHANNEL_B_DE; // DE = 0 (driver OFF)
+                chip_232->gpio_state |= CHANNEL_B_RE;  // RE = 1 (receiver OFF/tri-state)
+            }
+            sc16is7xx_chip_reg_write(chip_232, IOSTATE, chip_232->gpio_state);
+
+            LOG_INF("Channel %d: RS-485 transceiver disabled for RS-232 mode",
+                    dev_cfg->serport_num);
+        }
+        k_mutex_unlock(&sc16is7xx_chip_mutex);
 
         LOG_INF("Channel %d RS-232 configured: EFCR=0x%02X", dev_cfg->serport_num, efcr);
         break;
@@ -839,6 +866,68 @@ static int sc16is7xx_config_get(const struct device *dev,
 }
 #endif
 
+/**
+ * @brief Diagnostic function to check UART status
+ */
+void sc16is7xx_diagnose(const struct device *dev)
+{
+    const struct sc16is7xx_device_config *const config = dev->config;
+
+    LOG_INF("=== UART Diagnostics: Chip 0x%02X, Channel %d ===",
+            config->bus.addr, config->serport_num);
+
+    /* Read all status registers */
+    uint8_t lsr = INBYTE(dev, LSR(dev));
+    uint8_t msr = INBYTE(dev, MSR(dev));
+    uint8_t rxlvl = INBYTE(dev, RXLVL(dev));
+    uint8_t txlvl = INBYTE(dev, TXLVL(dev));
+    uint8_t lcr = INBYTE(dev, LCR(dev));
+    uint8_t mcr = INBYTE(dev, MCR(dev));
+    uint8_t efcr = INBYTE(dev, EFCR(dev));
+
+    LOG_INF("LSR   = 0x%02X (RXRDY=%d, THRE=%d, TEMT=%d, OE=%d, PE=%d, FE=%d)",
+            lsr,
+            !!(lsr & LSR_RXRDY),
+            !!(lsr & LSR_THRE),
+            !!(lsr & LSR_TEMT),
+            !!(lsr & LSR_OE),
+            !!(lsr & LSR_PE),
+            !!(lsr & LSR_FE));
+
+    LOG_INF("RXLVL = %d bytes in RX FIFO", rxlvl);
+    LOG_INF("TXLVL = %d bytes in TX FIFO", txlvl);
+    LOG_INF("LCR   = 0x%02X", lcr);
+    LOG_INF("MCR   = 0x%02X", mcr);
+    LOG_INF("MSR   = 0x%02X", msr);
+    LOG_INF("EFCR  = 0x%02X", efcr);
+
+    /* Check GPIO state */
+    k_mutex_lock(&sc16is7xx_chip_mutex, K_FOREVER);
+    struct sc16is7xx_chip_state *chip = sc16is7xx_get_chip_state(dev);
+    if (chip)
+    {
+        uint8_t gpio_state = sc16is7xx_chip_reg_read(chip, IOSTATE);
+        LOG_INF("GPIO  = 0x%02X (cached=0x%02X)", gpio_state, chip->gpio_state);
+
+        if (config->serport_num == 0)
+        {
+            LOG_INF("  Channel A: DE=%d, RE=%d (TX=%s)",
+                    !!(gpio_state & CHANNEL_A_DE),
+                    !!(gpio_state & CHANNEL_A_RE),
+                    (gpio_state & CHANNEL_A_DE) ? "ENABLED" : "RX MODE");
+        }
+        else
+        {
+            LOG_INF("  Channel B: DE=%d, RE=%d (TX=%s)",
+                    !!(gpio_state & CHANNEL_B_DE),
+                    !!(gpio_state & CHANNEL_B_RE),
+                    (gpio_state & CHANNEL_B_DE) ? "ENABLED" : "RX MODE");
+        }
+    }
+    k_mutex_unlock(&sc16is7xx_chip_mutex);
+
+    LOG_INF("=== End Diagnostics ===");
+}
 static int sc16is7xx_init(const struct device *dev)
 {
     struct sc16is7xx_dev_data *data = dev->data;
@@ -923,19 +1012,70 @@ static int sc16is7xx_init(const struct device *dev)
 
     LOG_INF("Chip @ 0x%02X, Channel %d: Initialization complete",
             config->bus.addr, config->serport_num);
+    sc16is7xx_diagnose(dev);
     return 0;
 }
 
 static int sc16is7xx_poll_in(const struct device *dev, unsigned char *c)
 {
     struct sc16is7xx_dev_data *data = dev->data;
+    const struct sc16is7xx_device_config *const config = dev->config;
     int ret = -1;
     k_spinlock_key_t key = k_spin_lock(&data->lock);
 
-    if ((INBYTE(dev, LSR(dev)) & LSR_RXRDY) != 0)
+    /* Read Line Status Register */
+    uint8_t lsr = INBYTE(dev, LSR(dev));
+
+    /* Debug: Log LSR on every call (you can reduce this later) */
+    static int poll_count = 0;
+    poll_count++;
+
+    /* Log every 100th poll, or when data is available, or on errors */
+    if ((poll_count % 100 == 0) || (lsr & LSR_RXRDY) || (lsr & LSR_EOB_MASK))
+    {
+        LOG_DBG("poll_in[%d]: Chip=0x%02X, Ch=%d, LSR=0x%02X",
+                poll_count, config->bus.addr, config->serport_num, lsr);
+    }
+
+    /* Check for errors first */
+    if (lsr & LSR_OE)
+    {
+        LOG_ERR("Overrun Error detected! Chip=0x%02X, Ch=%d",
+                config->bus.addr, config->serport_num);
+    }
+    if (lsr & LSR_PE)
+    {
+        LOG_ERR("Parity Error detected! Chip=0x%02X, Ch=%d",
+                config->bus.addr, config->serport_num);
+    }
+    if (lsr & LSR_FE)
+    {
+        LOG_ERR("Framing Error detected! Chip=0x%02X, Ch=%d",
+                config->bus.addr, config->serport_num);
+    }
+    if (lsr & LSR_BI)
+    {
+        LOG_ERR("Break Interrupt detected! Chip=0x%02X, Ch=%d",
+                config->bus.addr, config->serport_num);
+    }
+
+    /* Check if data is available */
+    if ((lsr & LSR_RXRDY) != 0)
     {
         *c = INBYTE(dev, RDR(dev));
         ret = 0;
+
+        /* Log received byte */
+        if (*c >= 32 && *c <= 126)
+        {
+            LOG_INF("RX: Chip=0x%02X, Ch=%d, Data='%c' (0x%02X)",
+                    config->bus.addr, config->serport_num, *c, *c);
+        }
+        else
+        {
+            LOG_INF("RX: Chip=0x%02X, Ch=%d, Data=0x%02X",
+                    config->bus.addr, config->serport_num, *c);
+        }
     }
 
     k_spin_unlock(&data->lock, key);
@@ -946,16 +1086,299 @@ static int sc16is7xx_poll_in(const struct device *dev, unsigned char *c)
 static void sc16is7xx_poll_out(const struct device *dev, unsigned char c)
 {
     struct sc16is7xx_dev_data *data = dev->data;
+    const struct sc16is7xx_device_config *const config = dev->config;
 
     k_spinlock_key_t key = k_spin_lock(&data->lock);
 
+    /* Wait for TX to be ready */
+    int timeout = 0;
     while ((INBYTE(dev, LSR(dev)) & LSR_THRE) == 0)
     {
+        timeout++;
+        if (timeout > 10000)
+        {
+            LOG_ERR("TX timeout! Chip=0x%02X, Ch=%d",
+                    config->bus.addr, config->serport_num);
+            k_spin_unlock(&data->lock, key);
+            return;
+        }
+        k_sleep(K_MSEC(10));
     }
 
+    /* Send byte */
     OUTBYTE(dev, THR(dev), c);
 
+    /* Log transmitted byte */
+    if (c >= 32 && c <= 126)
+    {
+        LOG_DBG("TX: Chip=0x%02X, Ch=%d, Data='%c' (0x%02X)",
+                config->bus.addr, config->serport_num, c, c);
+    }
+    else
+    {
+        LOG_DBG("TX: Chip=0x%02X, Ch=%d, Data=0x%02X",
+                config->bus.addr, config->serport_num, c);
+    }
+
     k_spin_unlock(&data->lock, key);
+}
+
+// static int sc16is7xx_poll_in(const struct device *dev, unsigned char *c)
+// {
+//     struct sc16is7xx_dev_data *data = dev->data;
+//     int ret = -1;
+//     k_spinlock_key_t key = k_spin_lock(&data->lock);
+
+//     if ((INBYTE(dev, LSR(dev)) & LSR_RXRDY) != 0)
+//     {
+//         *c = INBYTE(dev, RDR(dev));
+//         ret = 0;
+//     }
+
+//     k_spin_unlock(&data->lock, key);
+
+//     return ret;
+// }
+
+// static void sc16is7xx_poll_out(const struct device *dev, unsigned char c)
+// {
+//     struct sc16is7xx_dev_data *data = dev->data;
+
+//     k_spinlock_key_t key = k_spin_lock(&data->lock);
+
+//     while ((INBYTE(dev, LSR(dev)) & LSR_THRE) == 0)
+//     {
+//     }
+
+//     OUTBYTE(dev, THR(dev), c);
+
+//     k_spin_unlock(&data->lock, key);
+// }
+
+void sc16is7xx_gpio_control(const struct device *dev, uint8_t gpio_mask, uint8_t gpio_value)
+{
+    const struct sc16is7xx_device_config *const dev_cfg = dev->config;
+
+    k_mutex_lock(&sc16is7xx_chip_mutex, K_FOREVER);
+
+    struct sc16is7xx_chip_state *chip = sc16is7xx_get_chip_state(dev);
+    if (!chip)
+    {
+        k_mutex_unlock(&sc16is7xx_chip_mutex);
+        return;
+    }
+
+    /* Modify only the specified bits */
+    chip->gpio_state = (chip->gpio_state & ~gpio_mask) | (gpio_value & gpio_mask);
+    sc16is7xx_chip_reg_write(chip, IOSTATE, chip->gpio_state);
+
+    LOG_DBG("GPIO control: Chip=0x%02X, mask=0x%02X, value=0x%02X, new_state=0x%02X",
+            dev_cfg->bus.addr, gpio_mask, gpio_value, chip->gpio_state);
+
+    k_mutex_unlock(&sc16is7xx_chip_mutex);
+}
+
+void sc16is7xx_set_rs485_state(const struct device *dev, sc16is7xx_rs485_state_t state)
+{
+    const struct sc16is7xx_device_config *const dev_cfg = dev->config;
+    struct sc16is7xx_dev_data *const drv_data = dev->data;
+
+    /* If switching to RX, wait for TX to complete first */
+    if (state == SC16IS7XX_RS485_RX)
+    {
+        k_spinlock_key_t key = k_spin_lock(&drv_data->lock);
+        int timeout = 10000;
+        while (timeout--)
+        {
+            uint8_t lsr = INBYTE(dev, LSR(dev));
+            if ((lsr & (LSR_TEMT | LSR_THRE)) == (LSR_TEMT | LSR_THRE))
+            {
+                break; /* TX completely empty */
+            }
+            k_spin_unlock(&drv_data->lock, key);
+            k_busy_wait(100);
+            key = k_spin_lock(&drv_data->lock);
+        }
+        k_spin_unlock(&drv_data->lock, key);
+
+        if (timeout <= 0)
+        {
+            LOG_WRN("TX buffer not empty when switching to RX");
+        }
+    }
+
+    k_mutex_lock(&sc16is7xx_chip_mutex, K_FOREVER);
+
+    struct sc16is7xx_chip_state *chip = sc16is7xx_get_chip_state(dev);
+    if (!chip)
+    {
+        k_mutex_unlock(&sc16is7xx_chip_mutex);
+        return;
+    }
+
+    /* Determine which channel's DE/RE pins to control */
+    uint8_t de_pin, re_pin;
+    if (dev_cfg->serport_num == 0)
+    {
+        de_pin = CHANNEL_A_DE;
+        re_pin = CHANNEL_A_RE;
+    }
+    else
+    {
+        de_pin = CHANNEL_B_DE;
+        re_pin = CHANNEL_B_RE;
+    }
+
+    /* Set the appropriate state */
+    switch (state)
+    {
+    case SC16IS7XX_RS485_OFF:
+        chip->gpio_state &= ~de_pin; /* DE = LOW */
+        chip->gpio_state |= re_pin;  /* RE = HIGH (disabled) */
+        break;
+    case SC16IS7XX_RS485_RX:
+        chip->gpio_state &= ~de_pin; /* DE = LOW */
+        chip->gpio_state &= ~re_pin; /* RE = LOW (enabled) */
+        break;
+    case SC16IS7XX_RS485_TX:
+        chip->gpio_state |= de_pin; /* DE = HIGH */
+        chip->gpio_state |= re_pin; /* RE = HIGH */
+        break;
+    }
+
+    sc16is7xx_chip_reg_write(chip, IOSTATE, chip->gpio_state);
+
+    const char *state_str[] = {"OFF", "RX", "TX"};
+    LOG_DBG("RS485 state: %s (Chip=0x%02X, Ch=%d, GPIO=0x%02X)",
+            state_str[state], dev_cfg->bus.addr, dev_cfg->serport_num, chip->gpio_state);
+
+    k_mutex_unlock(&sc16is7xx_chip_mutex);
+}
+
+int sc16is7xx_write_fifo(const struct device *dev, const uint8_t *data, size_t len)
+{
+    const struct sc16is7xx_device_config *const config = dev->config;
+    struct sc16is7xx_dev_data *const drv_data = dev->data;
+    size_t written = 0;
+
+    if (!data || len == 0)
+    {
+        return 0;
+    }
+
+    k_spinlock_key_t key = k_spin_lock(&drv_data->lock);
+
+    /* Write data in chunks that fit in the 64-byte FIFO */
+    while (written < len)
+    {
+        /* Check available space in TX FIFO */
+        uint8_t txlvl = INBYTE(dev, TXLVL(dev));
+        size_t space_available = drv_data->fifo_size - txlvl;
+
+        if (space_available == 0)
+        {
+            break; /* FIFO full */
+        }
+
+        /* Write as much as we can */
+        size_t chunk_size = MIN(space_available, len - written);
+
+        /* Use I2C burst write for efficiency */
+        uint8_t tx_buf[65]; /* 1 byte register + 64 bytes data */
+        tx_buf[0] = THR(dev);
+        memcpy(&tx_buf[1], &data[written], chunk_size);
+
+        int ret = i2c_write_dt(&config->bus, tx_buf, chunk_size + 1);
+        if (ret < 0)
+        {
+            LOG_ERR("I2C write failed: %d", ret);
+            break;
+        }
+
+        written += chunk_size;
+
+        LOG_DBG("Wrote %d bytes to FIFO (%d/%d total)", chunk_size, written, len);
+
+        /* If FIFO is full, stop here */
+        if (written < len && space_available < drv_data->fifo_size)
+        {
+            break;
+        }
+    }
+
+    k_spin_unlock(&drv_data->lock, key);
+
+    return written;
+}
+
+bool sc16is7xx_tx_empty(const struct device *dev)
+{
+    struct sc16is7xx_dev_data *const drv_data = dev->data;
+
+    k_spinlock_key_t key = k_spin_lock(&drv_data->lock);
+    uint8_t lsr = INBYTE(dev, LSR(dev));
+    k_spin_unlock(&drv_data->lock, key);
+
+    return ((lsr & (LSR_TEMT | LSR_THRE)) == (LSR_TEMT | LSR_THRE));
+}
+
+int sc16is7xx_read_fifo(const struct device *dev, uint8_t *buffer, size_t max_len)
+{
+    struct sc16is7xx_dev_data *const drv_data = dev->data;
+    size_t read = 0;
+
+    if (!buffer || max_len == 0)
+    {
+        return 0;
+    }
+
+    k_spinlock_key_t key = k_spin_lock(&drv_data->lock);
+
+    /* Check how many bytes are available */
+    uint8_t rxlvl = INBYTE(dev, RXLVL(dev));
+
+    if (rxlvl == 0)
+    {
+        k_spin_unlock(&drv_data->lock, key);
+        return 0; /* No data */
+    }
+
+    /* Read available bytes (up to max_len) */
+    size_t to_read = MIN(rxlvl, max_len);
+
+    for (size_t i = 0; i < to_read; i++)
+    {
+        uint8_t lsr = INBYTE(dev, LSR(dev));
+
+        /* Check for errors */
+        if (lsr & LSR_OE)
+        {
+            LOG_ERR("Overrun error");
+        }
+        if (lsr & LSR_PE)
+        {
+            LOG_ERR("Parity error");
+        }
+        if (lsr & LSR_FE)
+        {
+            LOG_ERR("Framing error");
+        }
+
+        if (lsr & LSR_RXRDY)
+        {
+            buffer[read++] = INBYTE(dev, RDR(dev));
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    k_spin_unlock(&drv_data->lock, key);
+
+    LOG_DBG("Read %d bytes from FIFO", read);
+
+    return read;
 }
 
 static int sc16is7xx_err_check(const struct device *dev)

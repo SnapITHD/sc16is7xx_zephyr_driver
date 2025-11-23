@@ -1,1 +1,1 @@
-rsource "opito_sc16is7xx_i2c/Kconfig"
+rsource "sc16is7xx_i2c/Kconfig"
