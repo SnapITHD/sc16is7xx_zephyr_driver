@@ -39,7 +39,7 @@ extern "C"
      * @param gpio_mask Which GPIO bits to modify (use GPIO pin defines)
      * @param gpio_value Value to set for those bits
      *
-     * Example: sc16is7xx_gpio_control(dev, POWER_12V_EN | POWER_5V_EN, POWER_12V_EN | POWER_5V_EN);
+     * Example: sc16is7xx_gpio_control(dev, POWER_12V_EN | POWER_5V_EN, POWER_12V_EN | POWER_5V_EN, 1);
      *          This sets GPIO6 and GPIO7 HIGH
      */
     void sc16is7xx_gpio_control(const struct device *dev, uint8_t gpio_mask, uint8_t gpio_value);
