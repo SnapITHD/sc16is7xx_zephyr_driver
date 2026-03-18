@@ -1164,7 +1164,6 @@ void sc16is7xx_set_rs485_state(const struct device *dev, sc16is7xx_rs485_state_t
 
 void sc16is7xx_post_transaction_sleep(const struct device *dev)
 {
-    const struct sc16is7xx_device_config *const config = dev->config;
     struct sc16is7xx_dev_data *const drv_data = dev->data;
     int64_t ms_since_last = CLAMP((k_uptime_get() - drv_data->last_transaction_time), 0, 400); // up to 400ms
 
