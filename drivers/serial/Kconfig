@@ -4,7 +4,8 @@
 menu "SC16IS7XX UART"
 config SC16IS7XX
 	bool "SC16IS7XX Dual UART"
-	default y if DT_HAS_NXP_SC16IS7XX_ENABLED
+	default y
+	depends on DT_HAS_NXP_SC16IS7XX_ENABLED
 	select I2C
 	help
 	  Enable driver for SC16IS7XX Dual UART.
